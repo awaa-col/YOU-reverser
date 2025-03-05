@@ -4,4 +4,6 @@ config.json
 
 logs/you_cookie_state.json
 
-AWA
+AWA/
+
+reverser/__pycache__/
