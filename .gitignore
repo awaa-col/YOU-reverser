@@ -1,0 +1,7 @@
+config.json
+
+*.log
+
+logs/you_cookie_state.json
+
+AWA
