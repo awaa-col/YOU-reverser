@@ -2,8 +2,8 @@ config.json
 
 *.log
 
-logs/you_cookie_state.json
-
+logs/*
+!logs/.gitkeep
 AWA/
 
 reverser/__pycache__/

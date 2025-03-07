@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 # 导入正确路径的客户端
 from reverser.YOU import YouComReverser
 from reverser.X import GrokAPI_X
-from reverser.Grok import GrokReverser_g
+from reverser.Grok import GrokReverser
 from reverser.cookie_manager import YouCookieManager, XCredentialManager, GrokCookieManager
 
 # 配置日志
@@ -249,7 +249,7 @@ async def initialize_clients():
             grok_cookie_manager = GrokCookieManager(cookies=grok_cookies, config=grok_cookie_config)
             
             # 初始化Grok.com客户端 - 使用cookie_manager参数
-            grok_client = await GrokReverser_g(Cookies=grok_cookies, cookie_manager=grok_cookie_manager).__aenter__()
+            grok_client = await GrokReverser(Cookies=grok_cookies, cookie_manager=grok_cookie_manager).__aenter__()
             logger.info(f"Grok.com客户端初始化成功，加载了 {len(grok_cookies)} 个Cookie")
         except Exception as e:
             logger.error(f"Grok.com客户端初始化失败: {str(e)}")
@@ -414,21 +414,29 @@ async def process_request(request_data: Dict[Any, Any]) -> AsyncGenerator[str, N
         # 提取实际模型名称
         actual_model = model
         logger.info(f"使用模型: {actual_model}")
-        # 获取最后一条用户消息
-        last_user_message = None
-        for msg in reversed(messages):
-            if msg["role"] == "user":
-                last_user_message = msg["content"]
-                break
         
-        if not last_user_message:
-            raise ValueError("未找到用户消息")
+        # 合并聊天历史为单个文本
+        formatted_messages = []
+        for msg in messages:
+            role = msg["role"]
+            content = msg["content"]
+            # 根据角色添加适当的前缀
+            if role == "system":
+                formatted_messages.append(f"{content}")
+            elif role == "user":
+                formatted_messages.append(f"{content}")
+            elif role == "assistant":
+                formatted_messages.append(f"{content}")
+        
+        # 将所有消息合并为单个文本字符串，用两个换行符分隔
+        combined_message = "\n\n".join(formatted_messages)
         
         # 记录请求信息
         current_index = grok_cookie_manager.current_index
         logger.info(f"请求模型来源: Grok.com")
         logger.info(f"请求模型名: {actual_model}")
         logger.info(f"请求模型使用的Cookie索引: {current_index}")
+        logger.info(f"发送合并的聊天历史，总长度: {len(combined_message)}")
         
         try:
             # 获取下一个要使用的Cookie
@@ -437,7 +445,8 @@ async def process_request(request_data: Dict[Any, Any]) -> AsyncGenerator[str, N
             # 更新客户端的Cookie
             grok_client.headers["Cookie"] = cookie
             
-            async for token in grok_client.request2Grok(last_user_message, actual_model):
+            # 发送合并后的消息
+            async for token in grok_client.request2Grok(combined_message, actual_model):
                 yield token
                 
             # 增加请求计数

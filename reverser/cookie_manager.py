@@ -203,7 +203,7 @@ class YouCookieManager(BaseCookieManager):
 
             
             if response.status_code != 200:
-                logger.warning(f"You.com Cookie验证失败: 状态码 {response.status_code}\n返回Json:{response.json}")
+                logger.warning(f"You.com Cookie验证失败: 状态码 {response.status_code}\n返回{response.json}")
                 self._update_cookie_state(index, False)
                 return False
             
@@ -763,9 +763,13 @@ class XCredentialManager(BaseCookieManager):
         
         try:
             # 尝试获取用户数据来验证凭证
-            response = requests.get(
+            response = requests.post(
                 headers=headers,
-                url='https://api.x.com/graphql/3Eo8X-0b-XJA3E9kO0oYPw/UserByScreenName'
+                url='https://x.com/i/api/graphql/vvC5uy7pWWHXS2aDi1FZeA/CreateGrokConversation',
+                json={
+                    "variables": {},
+                    "queryId": "vvC5uy7pWWHXS2aDi1FZeA"
+                }
             )
             
             # 检查状态码
@@ -779,12 +783,6 @@ class XCredentialManager(BaseCookieManager):
             
             # 提取用户名
             username = "UNKNOWN"
-            try:
-                result = data.get("data", {}).get("user", {})
-                if result:
-                    username = result.get("legacy", {}).get("screen_name", "UNKNOWN")
-            except:
-                pass
             
             # 更新凭证状态
             self._update_credential_state(index, True, username)
@@ -989,6 +987,9 @@ class GrokCookieManager(BaseCookieManager):
         """
         super().__init__(config, state_file="logs/grok_cookie_state.json")
         self.cookies = cookies
+        self.base_url = 'https://grok.com'  # 与 GrokReverser 使用相同的基础URL
+        self.cf_challenge_count = 0  # 记录CloudFlare挑战次数
+        self.last_cf_challenge = None  # 最后一次CloudFlare挑战时间
         
         # 初始化Cookie状态
         for i, cookie in enumerate(cookies):
@@ -1002,7 +1003,10 @@ class GrokCookieManager(BaseCookieManager):
                     "last_used": None,
                     "username": "UNKNOWN",
                     "is_cooling": False,
-                    "next_available": None
+                    "next_available": None,
+                    "remaining_queries": None,
+                    "total_queries": None,
+                    "window_size": None
                 }
         
         # 验证所有Cookie
@@ -1041,60 +1045,145 @@ class GrokCookieManager(BaseCookieManager):
         Returns:
             Cookie是否有效
         """
-        import requests
+        import cloudscraper
         
         cookie_id = f"cookie_{index}"
         cookie = self.cookies[index]
         
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
             "Cookie": cookie
         }
         
-        try:
-            # 尝试获取用户数据来验证Cookie
-            response = requests.get(
-                headers=headers,
-                url='https://grok.x.ai/api/user'
-            )
-            
-            # 检查状态码
-            if response.status_code != 200:
-                logger.warning(f"Grok.com Cookie验证失败: 状态码 {response.status_code}")
-                self._update_cookie_state(index, False)
+        validation_body = {
+            "requestKind": "DEFAULT",
+            "modelName": "grok-3"
+        }
+        
+        # 重试逻辑
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count <= max_retries:
+            try:
+                # 创建cloudscraper实例来绕过CloudFlare保护
+                scraper = cloudscraper.create_scraper(
+                    browser={
+                        'browser': 'chrome',
+                        'platform': 'windows',
+                        'mobile': False
+                    },
+                    interpreter='js2py',
+                    delay=0.5 + (retry_count * 0.5)
+                )
+                scraper.headers.update(headers)
+                
+                # 使用与GrokReverser相同的验证端点和方法
+                response = scraper.post(
+                    f"{self.base_url}/rest/rate-limits",
+                    json=validation_body
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if all(k in data for k in ["windowSizeSeconds", "remainingQueries", "totalQueries"]):
+                        # 确保所有值都是整数类型
+                        remaining_queries = int(data["remainingQueries"]) if data["remainingQueries"] is not None else 0
+                        total_queries = int(data["totalQueries"]) if data["totalQueries"] is not None else 0
+                        window_size = int(data["windowSizeSeconds"]) if data["windowSizeSeconds"] is not None else 0
+                        
+                        # 更新Cookie状态
+                        self._update_cookie_state(
+                            index, 
+                            True, 
+                            remaining_queries=remaining_queries,
+                            total_queries=total_queries,
+                            window_size=window_size,
+                            is_cooling=remaining_queries <= 0
+                        )
+                        
+                        logger.info(f"Grok.com Cookie验证成功: 剩余额度 {remaining_queries}/{total_queries}")
+                        return remaining_queries > 0
+                        
+                elif response.status_code == 403:
+                    # 检查是否是CF盾的问题
+                    if "cloudflare" in response.text.lower():
+                        logger.warning(f"Grok.com Cookie验证挑战: CloudFlare检测 (尝试 {retry_count+1}/{max_retries})")
+                        self.cf_challenge_count += 1
+                        self.last_cf_challenge = datetime.now()
+                        retry_count += 1
+                        if retry_count <= max_retries:
+                            continue
+                        else:
+                            logger.warning(f"Grok.com Cookie验证失败: CloudFlare保护无法绕过")
+                            self._update_cookie_state(index, False, error="CloudFlare保护无法绕过")
+                            return False
+                    else:
+                        logger.warning(f"Grok.com Cookie验证失败: 状态码 403")
+                        self._update_cookie_state(index, False, error="状态码 403")
+                        return False
+                else:
+                    logger.warning(f"Grok.com Cookie验证失败: 状态码 {response.status_code}")
+                    self._update_cookie_state(index, False, error=f"状态码 {response.status_code}")
+                    return False
+                    
+            except Exception as e:
+                error_msg = str(e)
+                
+                # 检查是否与CloudFlare相关的错误
+                if "cloudflare" in error_msg.lower():
+                    logger.warning(f"Grok.com Cookie验证CloudFlare错误 (尝试 {retry_count+1}/{max_retries}): {error_msg}")
+                    self.cf_challenge_count += 1
+                    self.last_cf_challenge = datetime.now()
+                    retry_count += 1
+                    if retry_count <= max_retries:
+                        continue
+                
+                logger.error(f"Grok.com Cookie验证错误: {error_msg}")
+                self._update_cookie_state(index, False, error=error_msg)
                 return False
             
-            # 尝试解析响应
-            data = response.json()
-            
-            # 提取用户名
-            username = "UNKNOWN"
-            if data and "username" in data:
-                username = data["username"]
-            
-            # 更新Cookie状态
-            self._update_cookie_state(index, True, username)
-            
-            logger.info(f"Grok.com Cookie验证成功: {username}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Grok.com Cookie验证错误: {str(e)}")
-            self._update_cookie_state(index, False, error=str(e))
-            return False
+            # 如果代码执行到这里，说明请求已经成功，可以退出循环
+            break
+        
+        # 默认情况（不应该到达这里）
+        return False
     
-    def _update_cookie_state(self, index: int, is_valid: bool, username: str = "UNKNOWN", error: str = ""):
+    def _update_cookie_state(self, index: int, is_valid: bool, username: str = "UNKNOWN", 
+                            error: str = "", remaining_queries: int = None,
+                            total_queries: int = None, window_size: int = None,
+                            is_cooling: bool = False):
         """更新Cookie状态"""
         cookie_id = f"cookie_{index}"
         
-        self.cookie_states[cookie_id].update({
+        update_data = {
             "valid": is_valid,
-            "last_checked": datetime.now().isoformat(),
-            "username": username if is_valid else self.cookie_states[cookie_id].get("username", "UNKNOWN")
-        })
+            "last_checked": datetime.now().isoformat()
+        }
         
+        # 只在有效时更新username
+        if is_valid and username != "UNKNOWN":
+            update_data["username"] = username
+            
+        # 更新请求额度信息 - 确保所有值都是整数或None
+        if remaining_queries is not None:
+            update_data["remaining_queries"] = int(remaining_queries)
+        if total_queries is not None:
+            update_data["total_queries"] = int(total_queries)
+        if window_size is not None:
+            update_data["window_size"] = int(window_size)
+            
+        # 更新冷却状态
+        update_data["is_cooling"] = bool(is_cooling)
+        
+        # 记录错误信息
         if error:
-            self.cookie_states[cookie_id]["error"] = error
+            update_data["error"] = error
+            
+        # 更新状态
+        self.cookie_states[cookie_id].update(update_data)
         
         self._save_state()
     
@@ -1136,6 +1225,12 @@ class GrokCookieManager(BaseCookieManager):
                 self.valid_indices, 
                 key=lambda i: self.cookie_states.get(f"cookie_{i}", {}).get("request_count", 0)
             )
+        elif rotation_strategy == "most_remaining":
+            # 选择剩余额度最多的Cookie
+            self.current_index = max(
+                self.valid_indices,
+                key=lambda i: self.cookie_states.get(f"cookie_{i}", {}).get("remaining_queries", 0) or 0
+            )
         else:
             # 默认轮询
             if self.current_index in self.valid_indices:
@@ -1148,6 +1243,17 @@ class GrokCookieManager(BaseCookieManager):
         # 更新使用记录
         cookie_id = f"cookie_{self.current_index}"
         self.cookie_states[cookie_id]["last_used"] = datetime.now().isoformat()
+        
+        # 如果有请求额度信息，减少剩余额度
+        remaining = self.cookie_states[cookie_id].get("remaining_queries")
+        if remaining is not None:
+            # 确保为整数并减1
+            remaining = int(remaining) if remaining is not None else 0
+            self.cookie_states[cookie_id]["remaining_queries"] = max(0, remaining - 1)
+            
+            # 如果剩余额度为0，标记为冷却
+            if self.cookie_states[cookie_id]["remaining_queries"] <= 0:
+                self.start_cooldown(self.current_index)
         
         # 保存状态
         self._save_state()
@@ -1163,7 +1269,8 @@ class GrokCookieManager(BaseCookieManager):
         if 0 <= index < len(self.cookies):
             cookie_id = f"cookie_{index}"
             if cookie_id in self.cookie_states:
-                self.cookie_states[cookie_id]["request_count"] = self.cookie_states[cookie_id].get("request_count", 0) + 1
+                request_count = self.cookie_states[cookie_id].get("request_count", 0)
+                self.cookie_states[cookie_id]["request_count"] = int(request_count) + 1
                 self._save_state()
     
     def mark_cookie_invalid(self, index: int, reason: str = ""):
@@ -1196,8 +1303,16 @@ class GrokCookieManager(BaseCookieManager):
         if 0 <= index < len(self.cookies):
             cookie_id = f"cookie_{index}"
             if cookie_id in self.cookie_states:
-                cooldown_minutes = self.get_cooldown_minutes()
-                next_available = datetime.now() + timedelta(minutes=cooldown_minutes)
+                # 获取窗口大小或使用默认冷却时间
+                window_size = self.cookie_states[cookie_id].get("window_size")
+                if window_size:
+                    # 使用窗口大小作为冷却时间（秒）
+                    window_size = int(window_size) if window_size is not None else 0
+                    next_available = datetime.now() + timedelta(seconds=window_size)
+                else:
+                    # 使用配置的冷却时间
+                    cooldown_minutes = self.get_cooldown_minutes()
+                    next_available = datetime.now() + timedelta(minutes=cooldown_minutes)
                 
                 self.cookie_states[cookie_id]["is_cooling"] = True
                 self.cookie_states[cookie_id]["next_available"] = next_available.isoformat()
@@ -1219,15 +1334,16 @@ class GrokCookieManager(BaseCookieManager):
                 next_available = datetime.fromisoformat(state["next_available"])
                 
                 if datetime.now() >= next_available:
-                    # 冷却结束
-                    self.cookie_states[cookie_id]["is_cooling"] = False
-                    self.cookie_states[cookie_id]["next_available"] = None
+                    # 冷却结束，但需要验证Cookie以确认额度已恢复
+                    is_valid = self.validate_cookie(i)
                     
-                    # 如果Cookie有效，添加回有效索引列表
-                    if state.get("valid", False) and i not in self.valid_indices:
+                    # 如果验证成功且Cookie有效，添加回有效索引列表
+                    if is_valid and i not in self.valid_indices:
                         self.valid_indices.append(i)
+                        logger.info(f"Grok.com Cookie {i} 冷却结束，现在可用")
+                    elif not is_valid:
+                        logger.warning(f"Grok.com Cookie {i} 冷却结束，但验证失败")
                     
-                    logger.info(f"Grok.com Cookie {i} 冷却结束，现在可用")
                     self._save_state()
     
     def get_stats(self) -> Dict:
@@ -1240,7 +1356,9 @@ class GrokCookieManager(BaseCookieManager):
             "total_cookies": len(self.cookies),
             "valid_cookies": len(self.valid_indices),
             "current_index": self.current_index,
-            "cookies": []
+            "cookies": [],
+            "cf_challenge_count": self.cf_challenge_count,
+            "last_cf_challenge": self.last_cf_challenge.isoformat() if self.last_cf_challenge else None
         }
         
         for i, cookie in enumerate(self.cookies):
@@ -1254,6 +1372,8 @@ class GrokCookieManager(BaseCookieManager):
                 "valid": state.get("valid", False),
                 "username": state.get("username", "UNKNOWN"),
                 "request_count": state.get("request_count", 0),
+                "remaining_queries": state.get("remaining_queries"),
+                "total_queries": state.get("total_queries"),
                 "last_used": state.get("last_used"),
                 "last_checked": state.get("last_checked"),
                 "is_cooling": state.get("is_cooling", False),
@@ -1261,7 +1381,3 @@ class GrokCookieManager(BaseCookieManager):
             })
         
         return stats
-    
-
-
-    
