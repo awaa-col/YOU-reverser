@@ -715,7 +715,12 @@ class XCredentialManager(BaseCookieManager):
         
         # 验证所有凭证
         self.validate_all_cookies()
-    
+    def __iter__(self):
+        """使凭证管理器可迭代，返回凭证列表"""
+        return iter(self.credentials)
+    def __len__(self):
+        """返回凭证列表的长度"""
+        return len(self.credentials)
     def validate_all_cookies(self):
         """验证所有凭证"""
         self.valid_indices = []
